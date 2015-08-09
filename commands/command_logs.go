@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/github/git-lfs/lfs"
-	"github.com/spf13/cobra"
+	"github.com/github/git-lfs/vendor/_nuts/github.com/spf13/cobra"
 )
 
 var (
@@ -96,9 +96,12 @@ func sortedLogs() []string {
 		return []string{}
 	}
 
-	names := make([]string, len(fileinfos))
-	for index, info := range fileinfos {
-		names[index] = info.Name()
+	names := make([]string, 0, len(fileinfos))
+	for _, info := range fileinfos {
+		if info.IsDir() {
+			continue
+		}
+		names = append(names, info.Name())
 	}
 
 	return names

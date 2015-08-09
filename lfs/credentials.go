@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"net/url"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -18,7 +17,8 @@ type credentialFunc func(Creds, string) (credentialFetcher, error)
 var execCreds credentialFunc
 
 func credentials(u *url.URL) (Creds, error) {
-	creds := Creds{"protocol": u.Scheme, "host": u.Host}
+	path := strings.TrimPrefix(u.Path, "/")
+	creds := Creds{"protocol": u.Scheme, "host": u.Host, "path": path}
 	cmd, err := execCreds(creds, "fill")
 	if err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func init() {
 		}
 
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ProcessState.Success() == false && os.Getenv("GIT_TERMINAL_PROMPT") == "0" {
+			if exitErr.ProcessState.Success() == false && !Config.GetenvBool("GIT_TERMINAL_PROMPT", true) {
 				return nil, fmt.Errorf("Change the GIT_TERMINAL_PROMPT env var to be prompted to enter your credentials for %s://%s.",
 					input["protocol"], input["host"])
 			}

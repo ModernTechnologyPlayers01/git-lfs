@@ -5,61 +5,83 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
-	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/github/git-lfs/git"
+	"github.com/github/git-lfs/vendor/_nuts/github.com/rubyist/tracerx"
+)
+
+var (
+	Config        = NewConfig()
+	defaultRemote = "origin"
 )
 
 type Configuration struct {
 	CurrentRemote         string
-	gitConfig             map[string]string
-	remotes               []string
-	httpClient            *http.Client
+	httpClient            *HttpClient
 	redirectingHttpClient *http.Client
+	envVars               map[string]string
 	isTracingHttp         bool
-	loading               sync.Mutex
-}
+	isLoggingStats        bool
 
-type Endpoint struct {
-	Url            string
-	SshUserAndHost string
-	SshPath        string
+	loading    sync.Mutex // guards initialization of gitConfig and remotes
+	gitConfig  map[string]string
+	remotes    []string
+	extensions map[string]Extension
 }
-
-var (
-	Config        = NewConfig()
-	httpPrefixRe  = regexp.MustCompile("\\Ahttps?://")
-	defaultRemote = "origin"
-)
 
 func NewConfig() *Configuration {
 	c := &Configuration{
 		CurrentRemote: defaultRemote,
-		isTracingHttp: len(os.Getenv("GIT_CURL_VERBOSE")) > 0,
+		envVars:       make(map[string]string),
 	}
+	c.isTracingHttp = c.GetenvBool("GIT_CURL_VERBOSE", false)
+	c.isLoggingStats = c.GetenvBool("GIT_LOG_STATS", false)
 	return c
 }
 
-func ObjectUrl(endpoint Endpoint, oid string) (*url.URL, error) {
-	u, err := url.Parse(endpoint.Url)
-	if err != nil {
-		return nil, err
+func (c *Configuration) Getenv(key string) string {
+	if i, ok := c.envVars[key]; ok {
+		return i
 	}
 
-	u.Path = path.Join(u.Path, "objects")
-	if len(oid) > 0 {
-		u.Path = path.Join(u.Path, oid)
+	v := os.Getenv(key)
+	c.envVars[key] = v
+	return v
+}
+
+func (c *Configuration) Setenv(key, value string) error {
+	// Check see if we have this in our cache, if so update it
+	if _, ok := c.envVars[key]; ok {
+		c.envVars[key] = value
 	}
-	return u, nil
+
+	// Now set in process
+	return os.Setenv(key, value)
+}
+
+// GetenvBool parses a boolean environment variable and returns the result as a bool.
+// If the environment variable is unset, empty, or if the parsing fails,
+// the value of def (default) is returned instead.
+func (c *Configuration) GetenvBool(key string, def bool) bool {
+	s := c.Getenv(key)
+	if len(s) == 0 {
+		return def
+	}
+
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func (c *Configuration) Endpoint() Endpoint {
 	if url, ok := c.GitConfig("lfs.url"); ok {
-		return Endpoint{Url: url}
+		return NewEndpoint(url)
 	}
 
 	if len(c.CurrentRemote) > 0 && c.CurrentRemote != defaultRemote {
@@ -71,12 +93,12 @@ func (c *Configuration) Endpoint() Endpoint {
 	return c.RemoteEndpoint(defaultRemote)
 }
 
-func (c *Configuration) ConcurrentUploads() int {
+func (c *Configuration) ConcurrentTransfers() int {
 	uploads := 3
 
-	if v, ok := c.GitConfig("lfs.concurrentuploads"); ok {
+	if v, ok := c.GitConfig("lfs.concurrenttransfers"); ok {
 		n, err := strconv.Atoi(v)
-		if err == nil {
+		if err == nil && n > 0 {
 			uploads = n
 		}
 	}
@@ -84,38 +106,58 @@ func (c *Configuration) ConcurrentUploads() int {
 	return uploads
 }
 
+func (c *Configuration) BatchTransfer() bool {
+	if v, ok := c.GitConfig("lfs.batch"); ok {
+		if v == "true" || v == "" {
+			return true
+		}
+
+		// Any numeric value except 0 is considered true
+		if n, err := strconv.Atoi(v); err == nil && n != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// PrivateAccess will retrieve the access value and return true if
+// the value is set to private. When a repo is marked as having private
+// access, the http requests for the batch api will fetch the credentials
+// before running, otherwise the request will run without credentials.
+func (c *Configuration) PrivateAccess() bool {
+	key := fmt.Sprintf("lfs.%s.access", c.Endpoint().Url)
+	if v, ok := c.GitConfig(key); ok {
+		if strings.ToLower(v) == "private" {
+			return true
+		}
+	}
+	return false
+}
+
+// SetPrivateAccess will set the private access flag in .git/config.
+func (c *Configuration) SetPrivateAccess() {
+	tracerx.Printf("setting repository access to private")
+	key := fmt.Sprintf("lfs.%s.access", c.Endpoint().Url)
+	configFile := filepath.Join(LocalGitDir, "config")
+	git.Config.SetLocal(configFile, key, "private")
+
+	// Modify the config cache because it's checked again in this process
+	// without being reloaded.
+	c.loading.Lock()
+	c.gitConfig[key] = "private"
+	c.loading.Unlock()
+}
+
 func (c *Configuration) RemoteEndpoint(remote string) Endpoint {
 	if len(remote) == 0 {
 		remote = defaultRemote
 	}
-
 	if url, ok := c.GitConfig("remote." + remote + ".lfsurl"); ok {
-		return Endpoint{Url: url}
+		return NewEndpoint(url)
 	}
 
 	if url, ok := c.GitConfig("remote." + remote + ".url"); ok {
-		endpoint := Endpoint{Url: url}
-
-		if !httpPrefixRe.MatchString(url) {
-			pieces := strings.SplitN(url, ":", 2)
-			hostPieces := strings.SplitN(pieces[0], "@", 2)
-			if len(hostPieces) < 2 {
-				endpoint.Url = "<unknown>"
-				return endpoint
-			}
-
-			endpoint.SshUserAndHost = pieces[0]
-			endpoint.SshPath = pieces[1]
-			endpoint.Url = fmt.Sprintf("https://%s/%s", hostPieces[1], pieces[1])
-		}
-
-		if path.Ext(url) == ".git" {
-			endpoint.Url += "/info/lfs"
-		} else {
-			endpoint.Url += ".git/info/lfs"
-		}
-
-		return endpoint
+		return NewEndpointFromCloneURL(url)
 	}
 
 	return Endpoint{}
@@ -124,6 +166,11 @@ func (c *Configuration) RemoteEndpoint(remote string) Endpoint {
 func (c *Configuration) Remotes() []string {
 	c.loadGitConfig()
 	return c.remotes
+}
+
+func (c *Configuration) Extensions() map[string]Extension {
+	c.loadGitConfig()
+	return c.extensions
 }
 
 func (c *Configuration) GitConfig(key string) (string, bool) {
@@ -141,16 +188,6 @@ func (c *Configuration) ObjectUrl(oid string) (*url.URL, error) {
 	return ObjectUrl(c.Endpoint(), oid)
 }
 
-type AltConfig struct {
-	Remote map[string]*struct {
-		Media string
-	}
-
-	Media struct {
-		Url string
-	}
-}
-
 func (c *Configuration) loadGitConfig() {
 	c.loading.Lock()
 	defer c.loading.Unlock()
@@ -162,6 +199,7 @@ func (c *Configuration) loadGitConfig() {
 	uniqRemotes := make(map[string]bool)
 
 	c.gitConfig = make(map[string]string)
+	c.extensions = make(map[string]Extension)
 
 	var output string
 	listOutput, err := git.Config.List()
@@ -169,12 +207,19 @@ func (c *Configuration) loadGitConfig() {
 		panic(fmt.Errorf("Error listing git config: %s", err))
 	}
 
-	fileOutput, err := git.Config.ListFromFile()
+	configFile := filepath.Join(LocalWorkingDir, ".gitconfig")
+	fileOutput, err := git.Config.ListFromFile(configFile)
 	if err != nil {
 		panic(fmt.Errorf("Error listing git config from file: %s", err))
 	}
 
-	output = fileOutput + "\n" + listOutput
+	localConfig := filepath.Join(LocalGitDir, "config")
+	localOutput, err := git.Config.ListFromFile(localConfig)
+	if err != nil {
+		panic(fmt.Errorf("Error listing git config from file %s", err))
+	}
+
+	output = fileOutput + "\n" + listOutput + "\n" + localOutput
 
 	lines := strings.Split(output, "\n")
 	for _, line := range lines {
@@ -183,12 +228,29 @@ func (c *Configuration) loadGitConfig() {
 			continue
 		}
 		key := strings.ToLower(pieces[0])
-		c.gitConfig[key] = pieces[1]
+		value := pieces[1]
+		c.gitConfig[key] = value
 
 		keyParts := strings.Split(key, ".")
 		if len(keyParts) > 1 && keyParts[0] == "remote" {
 			remote := keyParts[1]
 			uniqRemotes[remote] = remote == "origin"
+		} else if len(keyParts) == 4 && keyParts[0] == "lfs" && keyParts[1] == "extension" {
+			name := keyParts[2]
+			ext := c.extensions[name]
+			switch keyParts[3] {
+			case "clean":
+				ext.Clean = value
+			case "smudge":
+				ext.Smudge = value
+			case "priority":
+				p, err := strconv.Atoi(value)
+				if err == nil && p >= 0 {
+					ext.Priority = p
+				}
+			}
+			ext.Name = name
+			c.extensions[name] = ext
 		}
 	}
 

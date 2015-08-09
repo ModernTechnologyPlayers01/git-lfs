@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 
 	"github.com/github/git-lfs/lfs"
-	"github.com/spf13/cobra"
+	"github.com/github/git-lfs/vendor/_nuts/github.com/spf13/cobra"
 )
 
 var (
@@ -57,7 +57,7 @@ func smudgeCommand(cmd *cobra.Command, args []string) {
 		Error(err.Error())
 	}
 
-	err = ptr.Smudge(os.Stdout, filename, cb)
+	err = ptr.Smudge(os.Stdout, filename, true, cb)
 	if file != nil {
 		file.Close()
 	}

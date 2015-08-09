@@ -5,7 +5,7 @@ import (
 
 	"github.com/github/git-lfs/git"
 	"github.com/github/git-lfs/lfs"
-	"github.com/spf13/cobra"
+	"github.com/github/git-lfs/vendor/_nuts/github.com/spf13/cobra"
 )
 
 var (
@@ -51,7 +51,7 @@ func statusCommand(cmd *cobra.Command, args []string) {
 	remoteRef, err := git.CurrentRemoteRef()
 	if err == nil {
 
-		pointers, err := lfs.ScanRefs(ref, "^"+remoteRef)
+		pointers, err := lfs.ScanRefs(ref, "^"+remoteRef, nil)
 		if err != nil {
 			Panic(err, "Could not scan for Git LFS objects")
 		}

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Usage: . testlib.sh
 # Simple shell command language test library.
 #
@@ -20,6 +20,8 @@
 # Copyright (c) 2011-13 by Ryan Tomayko <http://tomayko.com>
 # License: MIT
 
+fullfile="$(pwd)/$0"
+
 . "test/testenv.sh"
 set -e
 
@@ -33,9 +35,9 @@ atexit () {
 
   if [ $failures -gt 0 ]; then
     exit 1
-  else
-    exit 0
   fi
+
+  exit 0
 }
 
 # create the trash dir
@@ -49,7 +51,10 @@ GITSERVER=undefined
 if [ -s $LFS_URL_FILE ]; then
   SHUTDOWN_LFS=no
 else
-  setup
+  setup || {
+    failures=$(( failures + 1 ))
+    exit $?
+  }
 fi
 
 GITSERVER=$(cat "$LFS_URL_FILE")
@@ -69,6 +74,16 @@ begin_test () {
     out="$TRASHDIR/out"
     err="$TRASHDIR/err"
     exec 1>"$out" 2>"$err"
+
+    # reset global git config
+    HOME="$TRASHDIR/home"
+    rm -rf "$TRASHDIR/home"
+    mkdir "$HOME"
+    cp "$TESTHOME/.gitconfig" "$HOME/.gitconfig"
+
+    if [ "$OSXKEYFILE" ]; then
+      ln -s "$TESTHOME/Library" "$HOME"
+    fi
 
     # allow the subshell to exit non-zero without exiting this process
     set -x +e

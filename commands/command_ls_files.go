@@ -3,7 +3,7 @@ package commands
 import (
 	"github.com/github/git-lfs/git"
 	"github.com/github/git-lfs/lfs"
-	"github.com/spf13/cobra"
+	"github.com/github/git-lfs/vendor/_nuts/github.com/spf13/cobra"
 )
 
 var (
@@ -27,7 +27,8 @@ func lsFilesCommand(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	pointers, err := lfs.ScanRefs(ref, "")
+	scanOpt := &lfs.ScanRefsOptions{SkipDeletedBlobs: true}
+	pointers, err := lfs.ScanRefs(ref, "", scanOpt)
 	if err != nil {
 		Panic(err, "Could not scan for Git LFS files")
 	}
