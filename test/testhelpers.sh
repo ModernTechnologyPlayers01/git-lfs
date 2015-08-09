@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # assert_pointer confirms that the pointer in the repository for $path in the
 # given $ref matches the given $oid and $size.
@@ -20,14 +20,64 @@ assert_pointer() {
   fi
 }
 
-# no-op.  check that the object does not exist in the git lfs server
-refute_server_object() {
-  echo "refute server object: no-op"
+# assert_local_object confirms that an object file is stored for the given oid &
+# has the correct size
+# $ assert_local_object "some-oid" size
+assert_local_object() {
+  local oid="$1"
+  local size="$2"
+  local cfg=`git lfs env | grep LocalMediaDir`
+  local f="${cfg:14}/${oid:0:2}/${oid:2:2}/$oid"
+  actualsize=$(wc -c <"$f" | tr -d '[[:space:]]')
+  if [ "$size" != "$actualsize" ]; then
+    exit 1
+  fi
 }
 
-# no-op.  check that the object does exist in the git lfs server
+# refute_local_object confirms that an object file is NOT stored for an oid
+# $ refute_local_object "some-oid"
+refute_local_object() {
+  local oid="$1"
+  local cfg=`git lfs env | grep LocalMediaDir`
+  local regex="LocalMediaDir=(\S+)"
+  local f="${cfg:14}/${oid:0:2}/${oid:2:2}/$oid"
+  if [ -e $f ]; then
+    exit 1
+  fi
+}
+
+# check that the object does not exist in the git lfs server. HTTP log is
+# written to http.log. JSON output is written to http.json.
+#
+#   $ refute_server_object "reponame" "oid"
+refute_server_object() {
+  local reponame="$1"
+  local oid="$2"
+  curl -v "$GITSERVER/$reponame.git/info/lfs/objects/$oid" \
+    -u "user:pass" \
+    -o http.json \
+    -H "Accept: application/vnd.git-lfs+json" 2>&1 |
+    tee http.log
+
+  grep "404 Not Found" http.log
+}
+
+# check that the object does exist in the git lfs server. HTTP log is written
+# to http.log. JSON output is written to http.json.
 assert_server_object() {
-  echo "assert server object: no-op"
+  local reponame="$1"
+  local oid="$2"
+  curl -v "$GITSERVER/$reponame.git/info/lfs/objects/$oid" \
+    -u "user:pass" \
+    -o http.json \
+    -H "Accept: application/vnd.git-lfs+json" 2>&1 |
+    tee http.log
+  grep "200 OK" http.log
+
+  grep "download" http.json || {
+    cat http.json
+    exit 1
+  }
 }
 
 # pointer returns a string Git LFS pointer file.
@@ -102,34 +152,69 @@ setup() {
   rm -rf "$REMOTEDIR"
   mkdir "$REMOTEDIR"
 
-  if [ -z "$SKIPCOMPILE" ]; then
+  if [ -z "$SKIPCOMPILE" ] && [ -z "$LFS_BIN" ]; then
     echo "compile git-lfs for $0"
-    script/bootstrap
+    script/bootstrap || {
+      return $?
+    }
   fi
 
-  echo "Git LFS: $(which git-lfs)"
+  echo "Git LFS: ${LFS_BIN:-$(which git-lfs)}"
   git lfs version
+  git version
 
   if [ -z "$SKIPCOMPILE" ]; then
     for go in test/cmd/*.go; do
-      go build -o "$BINPATH/$(basename $go .go)" "$go"
+      go build -ldflags "-X main.credsDir $CREDSDIR" -o "$BINPATH/$(basename $go .go)" "$go"
     done
   fi
 
-  echo "tmp dir: $TMPDIR"
-  echo "remote git dir: $REMOTEDIR"
-  echo "LFSTEST_URL=$LFS_URL_FILE LFSTEST_DIR=$REMOTEDIR lfstest-gitserver"
   LFSTEST_URL="$LFS_URL_FILE" LFSTEST_DIR="$REMOTEDIR" lfstest-gitserver > "$REMOTEDIR/gitserver.log" 2>&1 &
 
-  mkdir $HOME
-  git config -f "$HOME/.gitconfig" filter.lfs.required true
-  git config -f "$HOME/.gitconfig" filter.lfs.smudge "git lfs smudge %f"
-  git config -f "$HOME/.gitconfig" filter.lfs.clean "git lfs clean %f"
-  git config -f "$HOME/.gitconfig" credential.helper lfstest
-  git config -f "$HOME/.gitconfig" user.name "Git LFS Tests"
-  git config -f "$HOME/.gitconfig" user.email "git-lfs@example.com"
+  # Set up the initial git config and osx keychain if applicable
+  HOME="$TESTHOME"
+  mkdir "$HOME"
+  git lfs init
+  git config --global credential.helper lfstest
+  git config --global user.name "Git LFS Tests"
+  git config --global user.email "git-lfs@example.com"
+  grep "git-lfs clean" "$REMOTEDIR/home/.gitconfig" > /dev/null || {
+    echo "global git config should be set in $REMOTEDIR/home"
+    ls -al "$REMOTEDIR/home"
+    exit 1
+  }
+
+  # setup the git credential password storage
+  mkdir -p "$CREDSDIR"
+  printf "user:pass" > "$CREDSDIR/127.0.0.1"
+
+  echo
+  echo "HOME: $HOME"
+  echo "TMP: $TMPDIR"
+  echo "lfstest-gitserver:"
+  echo "  LFSTEST_URL=$LFS_URL_FILE"
+  echo "  LFSTEST_DIR=$REMOTEDIR"
+  echo "GIT:"
+  git config --global --get-regexp "lfs|credential|user"
+
+  if [ "$OSXKEYFILE" ]; then
+    # Only OS X will encounter this
+    # We can't disable osxkeychain and it gets called on store as well as ours,
+    # reporting "A keychain cannot be found to store.." errors because the test
+    # user env has no keychain; so create one
+    mkdir -p $HOME/Library/Preferences # required to store keychain lists
+    security create-keychain -p pass "$OSXKEYFILE"
+    security list-keychains -s "$OSXKEYFILE"
+    security unlock-keychain -p pass "$OSXKEYFILE"
+    security set-keychain-settings -lut 7200 "$OSXKEYFILE"
+    security default-keychain -s "$OSXKEYFILE"
+
+    echo "OSX Keychain: $OSXKEYFILE"
+  fi
 
   wait_for_file "$LFS_URL_FILE"
+
+  echo
 }
 
 # shutdown cleans the $TRASHDIR and shuts the test Git server down.
@@ -140,9 +225,82 @@ shutdown() {
   if [ "$SHUTDOWN_LFS" != "no" ]; then
     # only cleanup test/remote after script/integration done OR a single
     # test/test-*.sh file is run manually.
-    [ -z "$KEEPTRASH" ] && rm -rf "$REMOTEDIR"
     if [ -s "$LFS_URL_FILE" ]; then
       curl "$(cat "$LFS_URL_FILE")/shutdown"
     fi
+
+    if [ "$OSXKEYFILE" ]; then
+      # explicitly clean up keychain to make sure search list doesn't look for it
+      # shouldn't matter because $HOME is separate & keychain prefs are there but still
+      security delete-keychain "$OSXKEYFILE"
+    fi
+
+    [ -z "$KEEPTRASH" ] && rm -rf "$REMOTEDIR"
+  fi
+}
+
+ensure_git_version_isnt() {
+  local expectedComparison=$1
+  local version=$2
+
+  local gitVersion=$(git version | cut -d" " -f3)
+
+  set +e
+  compare_version $gitVersion $version
+  result=$?
+  set -e
+
+  if [[ $result == $expectedComparison ]]; then
+    echo "skip: $0 (git version $(comparison_to_operator $expectedComparison) $version)"
+    exit
+  fi
+}
+
+VERSION_EQUAL=0
+VERSION_HIGHER=1
+VERSION_LOWER=2
+
+# Compare $1 and $2 and return VERSION_EQUAL / VERSION_LOWER / VERSION_HIGHER
+compare_version() {
+    if [[ $1 == $2 ]]
+    then
+        return $VERSION_EQUAL
+    fi
+    local IFS=.
+    local i ver1=($1) ver2=($2)
+    # fill empty fields in ver1 with zeros
+    for ((i=${#ver1[@]}; i<${#ver2[@]}; i++))
+    do
+        ver1[i]=0
+    done
+    for ((i=0; i<${#ver1[@]}; i++))
+    do
+        if [[ -z ${ver2[i]} ]]
+        then
+            # fill empty fields in ver2 with zeros
+            ver2[i]=0
+        fi
+        if ((10#${ver1[i]} > 10#${ver2[i]}))
+        then
+            return $VERSION_HIGHER
+        fi
+        if ((10#${ver1[i]} < 10#${ver2[i]}))
+        then
+            return $VERSION_LOWER
+        fi
+    done
+    return $VERSION_EQUAL
+}
+
+comparison_to_operator() {
+  local comparison=$1
+  if [[ $1 == $VERSION_EQUAL ]]; then
+    echo "=="
+  elif [[ $1 == $VERSION_HIGHER ]]; then
+    echo ">"
+  elif [[ $1 == $VERSION_LOWER ]]; then
+    echo "<"
+  else
+    echo "???"
   fi
 }

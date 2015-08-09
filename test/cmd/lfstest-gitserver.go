@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,13 +16,16 @@ import (
 	"net/textproto"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
+	"sync"
 )
 
 var (
 	repoDir      string
-	largeObjects = make(map[string][]byte)
+	largeObjects = newLfsStorage()
 	server       *httptest.Server
+	serveBatch   = true
 )
 
 func main() {
@@ -31,15 +35,26 @@ func main() {
 	server = httptest.NewServer(mux)
 	stopch := make(chan bool)
 
+	mux.HandleFunc("/startbatch", func(w http.ResponseWriter, r *http.Request) {
+		serveBatch = true
+	})
+
+	mux.HandleFunc("/stopbatch", func(w http.ResponseWriter, r *http.Request) {
+		serveBatch = false
+	})
+
 	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		stopch <- true
 	})
 
 	mux.HandleFunc("/storage/", storageHandler)
+	mux.HandleFunc("/redirect307/", redirect307Handler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/info/lfs") {
-			log.Printf("git lfs %s %s\n", r.Method, r.URL)
-			lfsHandler(w, r)
+			if !skipIfBadAuth(w, r) {
+				lfsHandler(w, r)
+			}
+
 			return
 		}
 
@@ -70,9 +85,9 @@ func main() {
 }
 
 type lfsObject struct {
-	Oid   string             `json:"oid,omitempty"`
-	Size  int64              `json:"size,omitempty"`
-	Links map[string]lfsLink `json:"_links,omitempty"`
+	Oid     string             `json:"oid,omitempty"`
+	Size    int64              `json:"size,omitempty"`
+	Actions map[string]lfsLink `json:"actions,omitempty"`
 }
 
 type lfsLink struct {
@@ -82,18 +97,34 @@ type lfsLink struct {
 
 // handles any requests with "{name}.server.git/info/lfs" in the path
 func lfsHandler(w http.ResponseWriter, r *http.Request) {
+	repo, err := repoFromLfsUrl(r.URL.Path)
+	if err != nil {
+		w.Write([]byte(err.Error()))
+		w.WriteHeader(500)
+		return
+	}
+
+	log.Printf("git lfs %s %s repo: %s\n", r.Method, r.URL, repo)
 	w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
 	switch r.Method {
 	case "POST":
-		lfsPostHandler(w, r)
+		if strings.HasSuffix(r.URL.String(), "batch") {
+			lfsBatchHandler(w, r, repo)
+		} else {
+			lfsPostHandler(w, r, repo)
+		}
 	case "GET":
-		lfsGetHandler(w, r)
+		lfsGetHandler(w, r, repo)
 	default:
 		w.WriteHeader(405)
 	}
 }
 
-func lfsPostHandler(w http.ResponseWriter, r *http.Request) {
+func lfsUrl(repo, oid string) string {
+	return server.URL + "/storage/" + oid + "?r=" + repo
+}
+
+func lfsPostHandler(w http.ResponseWriter, r *http.Request, repo string) {
 	buf := &bytes.Buffer{}
 	tee := io.TeeReader(r.Body, buf)
 	obj := &lfsObject{}
@@ -111,11 +142,18 @@ func lfsPostHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res := &lfsObject{
-		Links: map[string]lfsLink{
+		Oid:  obj.Oid,
+		Size: obj.Size,
+		Actions: map[string]lfsLink{
 			"upload": lfsLink{
-				Href: server.URL + "/storage/" + obj.Oid,
+				Href:   lfsUrl(repo, obj.Oid),
+				Header: map[string]string{},
 			},
 		},
+	}
+
+	if testingChunkedTransferEncoding(r) {
+		res.Actions["upload"].Header["Transfer-Encoding"] = "chunked"
 	}
 
 	by, err := json.Marshal(res)
@@ -130,11 +168,11 @@ func lfsPostHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(by)
 }
 
-func lfsGetHandler(w http.ResponseWriter, r *http.Request) {
+func lfsGetHandler(w http.ResponseWriter, r *http.Request, repo string) {
 	parts := strings.Split(r.URL.Path, "/")
 	oid := parts[len(parts)-1]
 
-	by, ok := largeObjects[oid]
+	by, ok := largeObjects.Get(repo, oid)
 	if !ok {
 		w.WriteHeader(404)
 		return
@@ -143,9 +181,9 @@ func lfsGetHandler(w http.ResponseWriter, r *http.Request) {
 	obj := &lfsObject{
 		Oid:  oid,
 		Size: int64(len(by)),
-		Links: map[string]lfsLink{
+		Actions: map[string]lfsLink{
 			"download": lfsLink{
-				Href: server.URL + "/storage/" + oid,
+				Href: lfsUrl(repo, oid),
 			},
 		},
 	}
@@ -162,11 +200,85 @@ func lfsGetHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(by)
 }
 
+func lfsBatchHandler(w http.ResponseWriter, r *http.Request, repo string) {
+	if !serveBatch {
+		w.WriteHeader(404)
+		return
+	}
+
+	type batchReq struct {
+		Operation string      `json:"operation"`
+		Objects   []lfsObject `json:"objects"`
+	}
+
+	buf := &bytes.Buffer{}
+	tee := io.TeeReader(r.Body, buf)
+	var objs batchReq
+	err := json.NewDecoder(tee).Decode(&objs)
+	io.Copy(ioutil.Discard, r.Body)
+	r.Body.Close()
+
+	log.Println("REQUEST")
+	log.Println(buf.String())
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	res := []lfsObject{}
+	testingChunked := testingChunkedTransferEncoding(r)
+	for _, obj := range objs.Objects {
+		o := lfsObject{
+			Oid:  obj.Oid,
+			Size: obj.Size,
+			Actions: map[string]lfsLink{
+				"upload": lfsLink{
+					Href:   lfsUrl(repo, obj.Oid),
+					Header: map[string]string{},
+				},
+			},
+		}
+
+		if testingChunked {
+			o.Actions["upload"].Header["Transfer-Encoding"] = "chunked"
+		}
+
+		res = append(res, o)
+	}
+
+	ores := map[string][]lfsObject{"objects": res}
+
+	by, err := json.Marshal(ores)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("RESPONSE: 200")
+	log.Println(string(by))
+
+	w.WriteHeader(200)
+	w.Write(by)
+}
+
 // handles any /storage/{oid} requests
 func storageHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("storage %s %s\n", r.Method, r.URL)
+	repo := r.URL.Query().Get("r")
+	log.Printf("storage %s %s repo: %s\n", r.Method, r.URL, repo)
 	switch r.Method {
 	case "PUT":
+		if testingChunkedTransferEncoding(r) {
+			valid := false
+			for _, value := range r.TransferEncoding {
+				if value == "chunked" {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				log.Fatal("Chunked transfer encoding expected")
+			}
+		}
+
 		hash := sha256.New()
 		buf := &bytes.Buffer{}
 		io.Copy(io.MultiWriter(hash, buf), r.Body)
@@ -176,13 +288,13 @@ func storageHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		largeObjects[oid] = buf.Bytes()
+		largeObjects.Set(repo, oid, buf.Bytes())
 
 	case "GET":
 		parts := strings.Split(r.URL.Path, "/")
 		oid := parts[len(parts)-1]
 
-		if by, ok := largeObjects[oid]; ok {
+		if by, ok := largeObjects.Get(repo, oid); ok {
 			w.Write(by)
 			return
 		}
@@ -235,4 +347,117 @@ func gitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	io.Copy(w, text.R)
+}
+
+func redirect307Handler(w http.ResponseWriter, r *http.Request) {
+	// Send a redirect to info/lfs
+	// Make it either absolute or relative depending on subpath
+	parts := strings.Split(r.URL.Path, "/")
+	// first element is always blank since rooted
+	var redirectTo string
+	if parts[2] == "rel" {
+		redirectTo = "/" + strings.Join(parts[3:], "/")
+	} else if parts[2] == "abs" {
+		redirectTo = server.URL + "/" + strings.Join(parts[3:], "/")
+	} else {
+		log.Fatal(fmt.Errorf("Invalid URL for redirect: %v", r.URL))
+		w.WriteHeader(404)
+		return
+	}
+	w.Header().Set("Location", redirectTo)
+	w.WriteHeader(307)
+}
+
+func testingChunkedTransferEncoding(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.String(), "/test-chunked-transfer-encoding")
+}
+
+var lfsUrlRE = regexp.MustCompile(`\A/?([^/]+)/info/lfs`)
+
+func repoFromLfsUrl(urlpath string) (string, error) {
+	matches := lfsUrlRE.FindStringSubmatch(urlpath)
+	if len(matches) != 2 {
+		return "", fmt.Errorf("LFS url '%s' does not match %v", urlpath, lfsUrlRE)
+	}
+
+	repo := matches[1]
+	if strings.HasSuffix(repo, ".git") {
+		return repo[0 : len(repo)-4], nil
+	}
+	return repo, nil
+}
+
+type lfsStorage struct {
+	objects map[string]map[string][]byte
+	mutex   *sync.Mutex
+}
+
+func (s *lfsStorage) Get(repo, oid string) ([]byte, bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	repoObjects, ok := s.objects[repo]
+	if !ok {
+		return nil, ok
+	}
+
+	by, ok := repoObjects[oid]
+	return by, ok
+}
+
+func (s *lfsStorage) Set(repo, oid string, by []byte) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	repoObjects, ok := s.objects[repo]
+	if !ok {
+		repoObjects = make(map[string][]byte)
+		s.objects[repo] = repoObjects
+	}
+	repoObjects[oid] = by
+}
+
+func newLfsStorage() *lfsStorage {
+	return &lfsStorage{
+		objects: make(map[string]map[string][]byte),
+		mutex:   &sync.Mutex{},
+	}
+}
+
+func skipIfBadAuth(w http.ResponseWriter, r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		w.WriteHeader(401)
+		return true
+	}
+
+	if strings.HasPrefix(auth, "Basic ") {
+		decodeBy, err := base64.StdEncoding.DecodeString(auth[6:len(auth)])
+		decoded := string(decodeBy)
+
+		if err != nil {
+			w.WriteHeader(403)
+			log.Printf("Error decoding auth: %s\n", err)
+			return true
+		}
+
+		parts := strings.SplitN(decoded, ":", 2)
+		if len(parts) == 2 {
+			switch parts[0] {
+			case "user":
+				if parts[1] == "pass" {
+					return false
+				}
+			case "path":
+				if strings.HasPrefix(r.URL.Path, "/"+parts[1]) {
+					return false
+				}
+				log.Printf("auth attempt against: %q", r.URL.Path)
+			}
+		}
+
+		log.Printf("auth does not match: %q", decoded)
+	}
+
+	w.WriteHeader(403)
+	log.Printf("Bad auth: %q\n", auth)
+	return true
 }

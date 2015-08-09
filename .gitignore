@@ -1,8 +1,5 @@
 bin/
 benchmark/
-.vendor/pkg
-servertest
-.vendor/src/github.com/github/git-lfs
 
 # only allow man/*.\d.ronn files
 man/*
@@ -16,3 +13,13 @@ debian/*.log
 debian/files
 debian/*.substvars
 obj-*
+
+rpm/BUILD*
+rpm/*RPMS
+rpm/*.log
+rpm/SOURCES
+
+repos
+docker/*.key
+
+src

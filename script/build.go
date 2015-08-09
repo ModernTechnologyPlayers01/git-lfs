@@ -25,26 +25,23 @@ var (
 		"windows": "Windows",
 		"amd64":   "AMD64",
 	}
+	LdFlag string
 )
 
 func mainBuild() {
-	cmd, err := exec.Command("script/fmt").Output()
-	if err != nil {
-		panic(err)
-	}
-
-	if len(cmd) > 0 {
-		fmt.Println(string(cmd))
-	}
-
 	if *ShowHelp {
 		fmt.Println("usage: script/bootstrap [-os] [-arch] [-all]")
 		flag.PrintDefaults()
 		return
 	}
 
-	buildMatrix := make(map[string]Release)
+	cmd, _ := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
 
+	if len(cmd) > 0 {
+		LdFlag = strings.TrimSpace("-X github.com/github/git-lfs/lfs.GitCommit " + string(cmd))
+	}
+
+	buildMatrix := make(map[string]Release)
 	errored := false
 
 	if *BuildAll {
@@ -56,31 +53,35 @@ func mainBuild() {
 			}
 		}
 	} else {
-		build(*BuildOS, *BuildArch, buildMatrix)
-		errored = true // skip build matrix stuff
+		if err := build(*BuildOS, *BuildArch, buildMatrix); err != nil {
+			log.Fatalln(err)
+		}
+		return // skip build matrix stuff
 	}
 
-	if !errored {
-		by, err := json.Marshal(buildMatrix)
-		if err != nil {
-			log.Fatalln("Error encoding build matrix to json:", err)
-		}
+	if errored {
+		os.Exit(1)
+	}
 
-		file, err := os.Create("bin/releases/build_matrix.json")
-		if err != nil {
-			log.Fatalln("Error creating build_matrix.json:", err)
-		}
+	by, err := json.Marshal(buildMatrix)
+	if err != nil {
+		log.Fatalln("Error encoding build matrix to json:", err)
+	}
 
-		written, err := file.Write(by)
-		file.Close()
+	file, err := os.Create("bin/releases/build_matrix.json")
+	if err != nil {
+		log.Fatalln("Error creating build_matrix.json:", err)
+	}
 
-		if err != nil {
-			log.Fatalln("Error writing build_matrix.json", err)
-		}
+	written, err := file.Write(by)
+	file.Close()
 
-		if jsonSize := len(by); written != jsonSize {
-			log.Fatalf("Expected to write %d bytes, actually wrote %d.\n", jsonSize, written)
-		}
+	if err != nil {
+		log.Fatalln("Error writing build_matrix.json", err)
+	}
+
+	if jsonSize := len(by); written != jsonSize {
+		log.Fatalf("Expected to write %d bytes, actually wrote %d.\n", jsonSize, written)
 	}
 }
 
@@ -94,15 +95,9 @@ func build(buildos, buildarch string, buildMatrix map[string]Release) error {
 		dir = filepath.Join(dir, "releases", buildos+"-"+buildarch, name)
 	}
 
-	filepath.Walk("cmd/git-lfs", func(path string, info os.FileInfo, err error) error {
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-
-		cmd := filepath.Base(path)
-		cmd = cmd[0 : len(cmd)-3]
-		return buildCommand(path, dir, buildos, buildarch)
-	})
+	if err := buildCommand(dir, buildos, buildarch); err != nil {
+		return err
+	}
 
 	if addenv {
 		err := os.MkdirAll(dir, 0755)
@@ -121,18 +116,23 @@ func build(buildos, buildarch string, buildMatrix map[string]Release) error {
 	return nil
 }
 
-func buildCommand(path, dir, buildos, buildarch string) error {
+func buildCommand(dir, buildos, buildarch string) error {
 	addenv := len(buildos) > 0 && len(buildarch) > 0
-	name := filepath.Base(path)
-	name = name[0 : len(name)-3]
 
-	bin := filepath.Join(dir, name)
+	bin := filepath.Join(dir, "git-lfs")
 
 	if buildos == "windows" {
 		bin = bin + ".exe"
 	}
 
-	cmd := exec.Command("go", "build", "-o", bin, path)
+	args := make([]string, 1, 6)
+	args[0] = "build"
+	if len(LdFlag) > 0 {
+		args = append(args, "-ldflags", LdFlag)
+	}
+	args = append(args, "-o", bin, ".")
+
+	cmd := exec.Command("go", args...)
 	if addenv {
 		cmd.Env = []string{
 			"GOOS=" + buildos,

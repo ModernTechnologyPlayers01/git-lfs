@@ -1,4 +1,5 @@
-#!/bin/sh -eu
+#!/usr/bin/env bash
+set -eu
 
 prefix="/usr/local"
 
@@ -8,9 +9,11 @@ elif [ "${BOXEN_HOME:-}" != "" ] ; then
   prefix=${BOXEN_HOME:-}
 fi
 
+mkdir -p $prefix/bin
+
 rm -rf $prefix/bin/git-lfs*
 for g in git*; do
-  install -D $g "$prefix/bin/$g"
+  install $g "$prefix/bin/$g"
 done
 
 PATH+=:$prefix/bin

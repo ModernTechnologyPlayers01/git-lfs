@@ -33,7 +33,7 @@ github.com/rubyist/tracerx
 github.com/technoweenie/go-contentaddressable
 github.com/kr/pretty
 github.com/github/git-lfs/git
-github.com/bmizerany/assert
+github.com/technoweenie/assert
 === RUN TestSuccessStatus
 --- PASS: TestSuccessStatus (0.00 seconds)
 PASS
@@ -97,7 +97,7 @@ Tests live in this `./test` directory, and must have a unique name like:
 `test/test-happy-path.sh` for an example.
 
 ```
-#!/bin/sh
+#!/usr/bin/env bash
 
 . "test/testlib.sh"
 
